@@ -1,9 +1,16 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
+import '../models/saved_plot.dart';
+import '../services/saved_plots_repository.dart';
+import '../utils/address_resolver.dart';
 import '../utils/geo_area_calculator.dart';
+import '../utils/label_marker_factory.dart';
 import '../widgets/area_info_panel.dart';
+import 'saved_plots_screen.dart';
 
 class LandAreaCalculatorScreen extends StatefulWidget {
   const LandAreaCalculatorScreen({super.key});
@@ -21,26 +28,51 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   /// The ordered list of boundary points the user has placed.
   final List<LatLng> _points = [];
 
-  bool _locating = true;
+  /// Points removed via "undo", most-recently-removed last, so "redo" can
+  /// put them back in the right order. Only the undo/redo pair feeds this
+  /// stack — deliberately removing a point via the marker sheet does not,
+  /// to keep the mental model simple ("redo" only reverses "undo").
+  final List<LatLng> _redoStack = [];
+
+  /// Small text-pill markers showing each side's length, regenerated
+  /// whenever the boundary changes.
+  Set<Marker> _lengthLabelMarkers = {};
+
+  LatLng? _initialCameraTarget;
+  bool _resolvingStartLocation = true;
+
+  final SavedPlotsRepository _savedPlotsRepository = SavedPlotsRepository();
 
   @override
   void initState() {
     super.initState();
-    _goToCurrentLocation(moveCamera: false);
+    _resolveStartLocation();
   }
 
   // ---------------------------------------------------------------------
   // Location
   // ---------------------------------------------------------------------
 
-  Future<void> _goToCurrentLocation({bool moveCamera = true}) async {
-    setState(() => _locating = true);
+  /// Figures out where to first point the camera *before* the map is
+  /// built, so it opens already centered on the user instead of opening
+  /// on the fallback location and only animating away from it afterwards
+  /// (which is what caused the "doesn't move to my location" bug).
+  Future<void> _resolveStartLocation() async {
+    final LatLng? here = await _tryGetCurrentLatLng();
+    if (!mounted) return;
+    setState(() {
+      _initialCameraTarget = here ?? _fallbackCenter;
+      _resolvingStartLocation = false;
+    });
+    if (here == null) {
+      _showSnack('Could not get your location — showing default area.');
+    }
+  }
+
+  Future<LatLng?> _tryGetCurrentLatLng() async {
     try {
       final bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        _showSnack('Please turn on location services to center the map.');
-        return;
-      }
+      if (!serviceEnabled) return null;
 
       LocationPermission permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
@@ -48,27 +80,27 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
       }
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
-        _showSnack('Location permission denied. Showing default location.');
-        return;
+        return null;
       }
 
       final Position position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
-
-      if (moveCamera && _mapController != null) {
-        await _mapController!.animateCamera(
-          CameraUpdate.newLatLngZoom(
-            LatLng(position.latitude, position.longitude),
-            18,
-          ),
-        );
-      }
+      return LatLng(position.latitude, position.longitude);
     } catch (_) {
-      _showSnack('Could not fetch current location.');
-    } finally {
-      if (mounted) setState(() => _locating = false);
+      return null;
     }
+  }
+
+  Future<void> _goToCurrentLocation() async {
+    final LatLng? here = await _tryGetCurrentLatLng();
+    if (here == null) {
+      _showSnack('Could not fetch current location.');
+      return;
+    }
+    await _mapController?.animateCamera(
+      CameraUpdate.newLatLngZoom(here, 18),
+    );
   }
 
   // ---------------------------------------------------------------------
@@ -76,18 +108,176 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   // ---------------------------------------------------------------------
 
   void _addPoint(LatLng point) {
-    setState(() => _points.add(point));
+    setState(() {
+      _points.add(point);
+      _redoStack.clear(); // a fresh action invalidates any pending redo
+    });
+    _refreshLengthLabels();
   }
 
   void _movePoint(int index, LatLng newPosition) {
     setState(() => _points[index] = newPosition);
+    _refreshLengthLabels();
+  }
+
+  void _undoLastPoint() {
+    if (_points.isEmpty) return;
+    setState(() => _redoStack.add(_points.removeLast()));
+    _refreshLengthLabels();
+  }
+
+  void _redoLastPoint() {
+    if (_redoStack.isEmpty) return;
+    setState(() => _points.add(_redoStack.removeLast()));
+    _refreshLengthLabels();
+  }
+
+  void _clearAllPoints() {
+    if (_points.isEmpty) return;
+    setState(() {
+      _points.clear();
+      _redoStack.clear();
+    });
+    _refreshLengthLabels();
+  }
+
+  Future<void> _saveCurrentPlot() async {
+    if (_points.length < 3) {
+      _showSnack('Place at least 3 points before saving.');
+      return;
+    }
+
+    final String? name = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        final controller = TextEditingController();
+        return AlertDialog(
+          title: const Text('Save this plot'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'e.g. Field near canal'),
+            onSubmitted: (value) => Navigator.pop(context, value.trim()),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (name == null || name.isEmpty) return;
+    if (!mounted) return;
+
+    // Reverse-geocode the plot's centroid so the saved entry carries a
+    // readable address, not just raw coordinates. Shown as a quick,
+    // dismiss-free loading dialog since this is usually sub-second but
+    // depends on network/geocoding availability.
+    unawaited(
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const AlertDialog(
+          content: Row(
+            children: [
+              SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              SizedBox(width: 16),
+              Text('Saving...'),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    final LatLng centroid = _centroidOf(_points);
+    final String? address = await AddressResolver.resolve(centroid);
+
+    if (!mounted) return;
+    Navigator.pop(context); // close the loading dialog
+
+    final plot = SavedPlot(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      name: name,
+      points: List.of(_points),
+      areaSquareMeters: GeoAreaCalculator.computeAreaInSquareMeters(_points),
+      createdAt: DateTime.now(),
+      address: address,
+    );
+    await _savedPlotsRepository.save(plot);
+    _showSnack(
+      address == null ? 'Saved "$name".' : 'Saved "$name" — $address',
+    );
+  }
+
+  LatLng _centroidOf(List<LatLng> points) {
+    double lat = 0, lng = 0;
+    for (final p in points) {
+      lat += p.latitude;
+      lng += p.longitude;
+    }
+    return LatLng(lat / points.length, lng / points.length);
+  }
+
+  Future<void> _openSavedPlots() async {
+    final SavedPlot? selected = await Navigator.push<SavedPlot>(
+      context,
+      MaterialPageRoute(builder: (context) => const SavedPlotsScreen()),
+    );
+    if (selected == null) return;
+
+    setState(() {
+      _points
+        ..clear()
+        ..addAll(selected.points);
+      _redoStack.clear();
+    });
+    await _refreshLengthLabels();
+    _fitCameraToCurrentPoints();
+  }
+
+  Future<void> _fitCameraToCurrentPoints() async {
+    if (_points.isEmpty || _mapController == null) return;
+    if (_points.length == 1) {
+      await _mapController!.animateCamera(
+        CameraUpdate.newLatLngZoom(_points.first, 18),
+      );
+      return;
+    }
+    double minLat = _points.first.latitude, maxLat = _points.first.latitude;
+    double minLng = _points.first.longitude, maxLng = _points.first.longitude;
+    for (final p in _points) {
+      minLat = p.latitude < minLat ? p.latitude : minLat;
+      maxLat = p.latitude > maxLat ? p.latitude : maxLat;
+      minLng = p.longitude < minLng ? p.longitude : minLng;
+      maxLng = p.longitude > maxLng ? p.longitude : maxLng;
+    }
+    await _mapController!.animateCamera(
+      CameraUpdate.newLatLngBounds(
+        LatLngBounds(
+          southwest: LatLng(minLat, minLng),
+          northeast: LatLng(maxLat, maxLng),
+        ),
+        60,
+      ),
+    );
   }
 
   /// google_maps_flutter's Marker widget doesn't expose a long-press
   /// callback (only onTap), so tapping directly on a placed marker is
-  /// the closest equivalent to "long press to remove". We surface it as
-  /// a small confirmation sheet so it's still a deliberate, undo-able
-  /// action rather than an accidental deletion.
+  /// the closest equivalent to "long press to remove". It's surfaced as
+  /// a confirmation sheet so it stays a deliberate, undo-able action
+  /// rather than an accidental deletion.
   void _confirmRemovePoint(int index) {
     showModalBottomSheet(
       context: context,
@@ -116,14 +306,13 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
                 SizedBox(
                   width: double.infinity,
                   child: FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: Colors.red,
-                    ),
+                    style: FilledButton.styleFrom(backgroundColor: Colors.red),
                     icon: const Icon(Icons.delete_outline),
                     label: const Text('Remove this point'),
                     onPressed: () {
                       Navigator.pop(context);
                       setState(() => _points.removeAt(index));
+                      _refreshLengthLabels();
                     },
                   ),
                 ),
@@ -143,16 +332,6 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
     );
   }
 
-  void _undoLastPoint() {
-    if (_points.isEmpty) return;
-    setState(() => _points.removeLast());
-  }
-
-  void _clearAllPoints() {
-    if (_points.isEmpty) return;
-    setState(() => _points.clear());
-  }
-
   void _showSnack(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -161,11 +340,76 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   }
 
   // ---------------------------------------------------------------------
+  // Side-length labels
+  // ---------------------------------------------------------------------
+
+  /// Recomputes the length of every side and regenerates the small on-map
+  /// label markers for them. Runs after any point add/move/remove — never
+  /// continuously during a drag — so it stays cheap.
+  Future<void> _refreshLengthLabels() async {
+    final List<_Edge> edges = _currentEdges();
+    if (edges.isEmpty) {
+      if (_lengthLabelMarkers.isNotEmpty && mounted) {
+        setState(() => _lengthLabelMarkers = {});
+      }
+      return;
+    }
+
+    final Set<Marker> newMarkers = {};
+    for (int i = 0; i < edges.length; i++) {
+      final _Edge edge = edges[i];
+      final double meters = GeoAreaCalculator.distanceInMeters(
+        edge.start,
+        edge.end,
+      );
+      final LatLng midpoint = LatLng(
+        (edge.start.latitude + edge.end.latitude) / 2,
+        (edge.start.longitude + edge.end.longitude) / 2,
+      );
+      final BitmapDescriptor icon = await LabelMarkerFactory.create(
+        '${meters.toStringAsFixed(1)} m',
+      );
+      newMarkers.add(
+        Marker(
+          markerId: MarkerId('edge_label_$i'),
+          position: midpoint,
+          icon: icon,
+          anchor: const Offset(0.5, 0.5),
+          zIndex: 1,
+          consumeTapEvents: false,
+        ),
+      );
+    }
+
+    if (!mounted) return;
+    setState(() => _lengthLabelMarkers = newMarkers);
+  }
+
+  List<_Edge> _currentEdges() {
+    if (_points.length == 2) {
+      return [_Edge(_points[0], _points[1])];
+    }
+    if (_points.length >= 3) {
+      return [
+        for (int i = 0; i < _points.length; i++)
+          _Edge(_points[i], _points[(i + 1) % _points.length]),
+      ];
+    }
+    return const [];
+  }
+
+  // ---------------------------------------------------------------------
   // Build
   // ---------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
+    if (_resolvingStartLocation) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
     final double areaSqMeters = GeoAreaCalculator.computeAreaInSquareMeters(
       _points,
     );
@@ -180,66 +424,103 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
             icon: const Icon(Icons.undo),
           ),
           IconButton(
+            tooltip: 'Redo',
+            onPressed: _redoStack.isEmpty ? null : _redoLastPoint,
+            icon: const Icon(Icons.redo),
+          ),
+          IconButton(
+            tooltip: 'Save this plot',
+            onPressed: _points.length < 3 ? null : _saveCurrentPlot,
+            icon: const Icon(Icons.save_outlined),
+          ),
+          IconButton(
+            tooltip: 'Saved plots',
+            onPressed: _openSavedPlots,
+            icon: const Icon(Icons.folder_open_outlined),
+          ),
+          IconButton(
             tooltip: 'Clear all points',
             onPressed: _points.isEmpty ? null : _clearAllPoints,
             icon: const Icon(Icons.delete_sweep_outlined),
           ),
         ],
       ),
-      body: Stack(
+      // A Column (map on top, info card below) instead of stacking the
+      // card over the whole screen — this is what stops the bottom card
+      // from covering the FAB / system nav buttons: the card now takes
+      // its own fixed space and the map+FAB area shrinks to fit above it.
+      body: Column(
         children: [
-          GoogleMap(
-            initialCameraPosition: const CameraPosition(
-              target: _fallbackCenter,
-              zoom: 15,
-            ),
-            onMapCreated: (controller) {
-              _mapController = controller;
-              _goToCurrentLocation();
-            },
-            onTap: _addPoint,
-            mapType: MapType.hybrid,
-            myLocationEnabled: true,
-            myLocationButtonEnabled: false,
-            zoomControlsEnabled: false,
-            markers: _buildMarkers(),
-            polygons: _buildPolygons(),
-            polylines: _buildPolylines(),
-          ),
-          if (_locating)
-            const Positioned(
-              top: 12,
-              left: 0,
-              right: 0,
-              child: Center(
-                child: SizedBox(
-                  height: 3,
-                  width: 120,
-                  child: LinearProgressIndicator(),
+          Expanded(
+            child: Stack(
+              children: [
+                GoogleMap(
+                  initialCameraPosition: CameraPosition(
+                    target: _initialCameraTarget!,
+                    zoom: 17,
+                  ),
+                  onMapCreated: (controller) => _mapController = controller,
+                  onTap: _addPoint,
+                  mapType: MapType.hybrid,
+                  myLocationEnabled: true,
+                  myLocationButtonEnabled: false,
+                  zoomControlsEnabled: false,
+                  markers: {..._buildPointMarkers(), ..._lengthLabelMarkers},
+                  polygons: _buildPolygons(),
+                  polylines: _buildPolylines(),
                 ),
-              ),
+                Positioned(
+                  top: 10,
+                  left: 0,
+                  right: 0,
+                  child: IgnorePointer(
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.55),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: const Text(
+                          'Tap map to add a point · tap a pin to remove it',
+                          style: TextStyle(color: Colors.white, fontSize: 11),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  right: 12,
+                  bottom: 12,
+                  child: FloatingActionButton(
+                    heroTag: 'locate_me',
+                    onPressed: _goToCurrentLocation,
+                    tooltip: 'Go to my location',
+                    child: const Icon(Icons.my_location),
+                  ),
+                ),
+              ],
             ),
-          Positioned(
-            left: 12,
-            right: 12,
-            bottom: 12,
-            child: AreaInfoPanel(
-              pointCount: _points.length,
-              areaInSquareMeters: areaSqMeters,
+          ),
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              child: AreaInfoPanel(
+                pointCount: _points.length,
+                areaInSquareMeters: areaSqMeters,
+              ),
             ),
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        heroTag: 'locate_me',
-        onPressed: () => _goToCurrentLocation(),
-        tooltip: 'Go to my location',
-        child: const Icon(Icons.my_location),
-      ),
     );
   }
 
-  Set<Marker> _buildMarkers() {
+  Set<Marker> _buildPointMarkers() {
     return {
       for (int i = 0; i < _points.length; i++)
         Marker(
@@ -250,8 +531,6 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
           icon: BitmapDescriptor.defaultMarkerWithHue(
             BitmapDescriptor.hueGreen,
           ),
-          // Marker has no onLongPress in google_maps_flutter — tapping it
-          // opens the remove confirmation instead. See _confirmRemovePoint.
           onTap: () => _confirmRemovePoint(i),
           onDragEnd: (newPosition) => _movePoint(i, newPosition),
         ),
@@ -272,10 +551,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   }
 
   Set<Polyline> _buildPolylines() {
-    // While there are fewer than 3 points, a filled polygon can't be
-    // drawn yet — show a simple connecting line instead so the user
-    // gets immediate visual feedback.
-    if (_points.length < 2 || _points.length >= 3) return {};
+    if (_points.length != 2) return {};
     return {
       Polyline(
         polylineId: const PolylineId('draft_line'),
@@ -285,4 +561,10 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
       ),
     };
   }
+}
+
+class _Edge {
+  const _Edge(this.start, this.end);
+  final LatLng start;
+  final LatLng end;
 }

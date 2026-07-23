@@ -58,6 +58,25 @@ class GeoAreaCalculator {
 
   static double _toRadians(double degrees) => degrees * math.pi / 180;
 
+  /// Straight-line (geodesic) distance between two points, in meters,
+  /// using the haversine formula. Used to label each side of the
+  /// boundary with its length.
+  static double distanceInMeters(LatLng a, LatLng b) {
+    final double lat1 = _toRadians(a.latitude);
+    final double lat2 = _toRadians(b.latitude);
+    final double dLat = _toRadians(b.latitude - a.latitude);
+    final double dLng = _toRadians(b.longitude - a.longitude);
+
+    final double h =
+        math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(lat1) *
+            math.cos(lat2) *
+            math.sin(dLng / 2) *
+            math.sin(dLng / 2);
+    final double c = 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h));
+    return _earthRadiusMeters * c;
+  }
+
   // ---------------- Unit conversions ----------------
 
   static double squareMetersToSquareFeet(double sqMeters) =>
