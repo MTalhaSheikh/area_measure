@@ -445,7 +445,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Land Area Calculator'),
+        title: const Text('GPS Measures'),
         actions: [
           IconButton(
             tooltip: 'Undo last point',
