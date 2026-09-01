@@ -64,17 +64,18 @@ class _SavedPlotsScreenState extends State<SavedPlotsScreen> {
               final double acres = GeoAreaCalculator.squareMetersToAcres(
                 plot.areaSquareMeters,
               );
-              final double marla = GeoAreaCalculator.squareMetersToMarla(
-                plot.areaSquareMeters,
-              );
+              final String areaLine = plot.showLocalUnits
+                  ? '${plot.areaSquareMeters.toStringAsFixed(1)} m² · '
+                        '${acres.toStringAsFixed(3)} acres · '
+                        '${GeoAreaCalculator.squareMetersToMarla(plot.areaSquareMeters).toStringAsFixed(1)} marla'
+                  : '${plot.areaSquareMeters.toStringAsFixed(1)} m² · '
+                        '${acres.toStringAsFixed(3)} acres';
               return ListTile(
                 leading: const Icon(Icons.crop_free),
                 title: Text(plot.name),
                 subtitle: Text(
                   '${plot.address ?? 'Address unavailable'}\n'
-                  '${plot.areaSquareMeters.toStringAsFixed(1)} m² · '
-                  '${acres.toStringAsFixed(3)} acres · '
-                  '${marla.toStringAsFixed(1)} marla\n'
+                  '$areaLine\n'
                   '${_formatDate(plot.createdAt)} · ${plot.points.length} points',
                 ),
                 isThreeLine: true,

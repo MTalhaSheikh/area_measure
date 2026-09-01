@@ -9,10 +9,15 @@ class AreaInfoPanel extends StatelessWidget {
     super.key,
     required this.pointCount,
     required this.areaInSquareMeters,
+    required this.showLocalUnits,
   });
 
   final int pointCount;
   final double areaInSquareMeters;
+
+  /// Whether to include marla/kanal alongside the universal units. False
+  /// when the user is outside Pakistan (see [RegionalUnits]).
+  final bool showLocalUnits;
 
   @override
   Widget build(BuildContext context) {
@@ -83,19 +88,21 @@ class AreaInfoPanel extends StatelessWidget {
                     ),
                     decimals: 3,
                   ),
-                  _AreaValue(
-                    label: 'marla',
-                    value: GeoAreaCalculator.squareMetersToMarla(
-                      areaInSquareMeters,
+                  if (showLocalUnits) ...[
+                    _AreaValue(
+                      label: 'marla',
+                      value: GeoAreaCalculator.squareMetersToMarla(
+                        areaInSquareMeters,
+                      ),
                     ),
-                  ),
-                  _AreaValue(
-                    label: 'kanal',
-                    value: GeoAreaCalculator.squareMetersToKanal(
-                      areaInSquareMeters,
+                    _AreaValue(
+                      label: 'kanal',
+                      value: GeoAreaCalculator.squareMetersToKanal(
+                        areaInSquareMeters,
+                      ),
+                      decimals: 3,
                     ),
-                    decimals: 3,
-                  ),
+                  ],
                 ],
               ),
             ] else if (pointCount > 0) ...[

@@ -9,6 +9,7 @@ import '../services/saved_plots_repository.dart';
 import '../utils/address_resolver.dart';
 import '../utils/geo_area_calculator.dart';
 import '../utils/label_marker_factory.dart';
+import '../utils/regional_units.dart';
 import '../widgets/area_info_panel.dart';
 import 'saved_plots_screen.dart';
 
@@ -43,6 +44,13 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
 
   final SavedPlotsRepository _savedPlotsRepository = SavedPlotsRepository();
 
+  MapType _mapType = MapType.hybrid;
+
+  /// Whether to show marla/kanal alongside the universal units. Defaults
+  /// to true (the app's home market is Pakistan) and is corrected to
+  /// false once we can confirm the user is somewhere else.
+  bool _showLocalUnits = true;
+
   @override
   void initState() {
     super.initState();
@@ -55,17 +63,31 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
 
   /// Figures out where to first point the camera *before* the map is
   /// built, so it opens already centered on the user instead of opening
-  /// on the fallback location and only animating away from it afterwards
-  /// (which is what caused the "doesn't move to my location" bug).
+  /// on the fallback location and only animating away from it afterwards.
   Future<void> _resolveStartLocation() async {
     final LatLng? here = await _tryGetCurrentLatLng();
     if (!mounted) return;
+    final LatLng target = here ?? _fallbackCenter;
     setState(() {
-      _initialCameraTarget = here ?? _fallbackCenter;
+      _initialCameraTarget = target;
       _resolvingStartLocation = false;
     });
     if (here == null) {
       _showSnack('Could not get your location — showing default area.');
+    }
+    // Non-blocking: don't hold up showing the map just to know which
+    // units to display. The panel updates itself once this resolves.
+    unawaited(_refreshLocalUnitsFlag(target));
+  }
+
+  Future<void> _refreshLocalUnitsFlag(LatLng target) async {
+    final ResolvedAddress resolved = await AddressResolver.resolve(target);
+    if (!mounted) return;
+    final bool shouldShowLocal = RegionalUnits.showLocalUnits(
+      resolved.isoCountryCode,
+    );
+    if (shouldShowLocal != _showLocalUnits) {
+      setState(() => _showLocalUnits = shouldShowLocal);
     }
   }
 
@@ -101,6 +123,9 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
     await _mapController?.animateCamera(
       CameraUpdate.newLatLngZoom(here, 18),
     );
+    // The user may have moved to a different country since the app
+    // opened (or this may be a more accurate fix than the startup one).
+    unawaited(_refreshLocalUnitsFlag(here));
   }
 
   // ---------------------------------------------------------------------
@@ -177,8 +202,8 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
     if (!mounted) return;
 
     // Reverse-geocode the plot's centroid so the saved entry carries a
-    // readable address, not just raw coordinates. Shown as a quick,
-    // dismiss-free loading dialog since this is usually sub-second but
+    // readable address (and knows which units make sense for it), not
+    // just raw coordinates. Shown as a quick loading dialog since this
     // depends on network/geocoding availability.
     unawaited(
       showDialog(
@@ -201,7 +226,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
     );
 
     final LatLng centroid = _centroidOf(_points);
-    final String? address = await AddressResolver.resolve(centroid);
+    final ResolvedAddress resolved = await AddressResolver.resolve(centroid);
 
     if (!mounted) return;
     Navigator.pop(context); // close the loading dialog
@@ -212,11 +237,14 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
       points: List.of(_points),
       areaSquareMeters: GeoAreaCalculator.computeAreaInSquareMeters(_points),
       createdAt: DateTime.now(),
-      address: address,
+      address: resolved.formatted,
+      showLocalUnits: RegionalUnits.showLocalUnits(resolved.isoCountryCode),
     );
     await _savedPlotsRepository.save(plot);
     _showSnack(
-      address == null ? 'Saved "$name".' : 'Saved "$name" — $address',
+      resolved.formatted == null
+          ? 'Saved "$name".'
+          : 'Saved "$name" — ${resolved.formatted}',
     );
   }
 
@@ -241,6 +269,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
         ..clear()
         ..addAll(selected.points);
       _redoStack.clear();
+      _showLocalUnits = selected.showLocalUnits;
     });
     await _refreshLengthLabels();
     _fitCameraToCurrentPoints();
@@ -447,8 +476,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
       ),
       // A Column (map on top, info card below) instead of stacking the
       // card over the whole screen — this is what stops the bottom card
-      // from covering the FAB / system nav buttons: the card now takes
-      // its own fixed space and the map+FAB area shrinks to fit above it.
+      // from covering the FAB / system nav buttons.
       body: Column(
         children: [
           Expanded(
@@ -461,7 +489,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
                   ),
                   onMapCreated: (controller) => _mapController = controller,
                   onTap: _addPoint,
-                  mapType: MapType.hybrid,
+                  mapType: _mapType,
                   myLocationEnabled: true,
                   myLocationButtonEnabled: false,
                   zoomControlsEnabled: false,
@@ -470,7 +498,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
                   polylines: _buildPolylines(),
                 ),
                 Positioned(
-                  top: 10,
+                  top: 60,
                   left: 0,
                   right: 0,
                   child: IgnorePointer(
@@ -493,6 +521,14 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
                   ),
                 ),
                 Positioned(
+                  left: 12,
+                  top: 12,
+                  child: _MapTypeButton(
+                    current: _mapType,
+                    onChanged: (type) => setState(() => _mapType = type),
+                  ),
+                ),
+                Positioned(
                   right: 12,
                   bottom: 12,
                   child: FloatingActionButton(
@@ -512,6 +548,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
               child: AreaInfoPanel(
                 pointCount: _points.length,
                 areaInSquareMeters: areaSqMeters,
+                showLocalUnits: _showLocalUnits,
               ),
             ),
           ),
@@ -567,4 +604,62 @@ class _Edge {
   const _Edge(this.start, this.end);
   final LatLng start;
   final LatLng end;
+}
+
+/// Small floating control that opens a menu for switching between the
+/// map's rendering styles (satellite, hybrid, standard roadmap, terrain).
+class _MapTypeButton extends StatelessWidget {
+  const _MapTypeButton({required this.current, required this.onChanged});
+
+  final MapType current;
+  final ValueChanged<MapType> onChanged;
+
+  static const List<(MapType, String, IconData)> _options = [
+    (MapType.hybrid, 'Hybrid', Icons.satellite_alt_outlined),
+    (MapType.satellite, 'Satellite', Icons.satellite_outlined),
+    (MapType.normal, 'Map', Icons.map_outlined),
+    (MapType.terrain, 'Terrain', Icons.terrain_outlined),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white,
+      shape: const CircleBorder(),
+      elevation: 4,
+      child: PopupMenuButton<MapType>(
+        tooltip: 'Change map view',
+        initialValue: current,
+        onSelected: onChanged,
+        icon: const Icon(Icons.layers_outlined),
+        itemBuilder: (context) => [
+          for (final (type, label, icon) in _options)
+            PopupMenuItem<MapType>(
+              value: type,
+              child: Row(
+                children: [
+                  Icon(
+                    icon,
+                    size: 20,
+                    color: type == current
+                        ? Theme.of(context).colorScheme.primary
+                        : null,
+                  ),
+                  const SizedBox(width: 12),
+                  Text(label),
+                  if (type == current) ...[
+                    const Spacer(),
+                    Icon(
+                      Icons.check,
+                      size: 18,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }

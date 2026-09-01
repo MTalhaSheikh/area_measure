@@ -27,8 +27,7 @@ class LabelMarkerFactory {
 
     // Outline pass: same text, stroked, drawn first (acts as a halo so
     // the label stays readable over both light and dark map tiles
-    // without needing a background box — this is what makes it read as
-    // noticeably smaller than the earlier pill design).
+    // without needing a background box).
     final TextPainter outlinePainter = TextPainter(
       text: TextSpan(
         text: text,
