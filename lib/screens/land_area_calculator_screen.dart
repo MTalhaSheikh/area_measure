@@ -5,6 +5,9 @@ import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 import '../models/saved_plot.dart';
+import '../services/app_update_service.dart';
+import '../services/points_budget_repository.dart';
+import '../services/rewarded_ad_service.dart';
 import '../services/saved_plots_repository.dart';
 import '../utils/address_resolver.dart';
 import '../utils/geo_area_calculator.dart';
@@ -23,6 +26,13 @@ class LandAreaCalculatorScreen extends StatefulWidget {
 
 class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   static const LatLng _fallbackCenter = LatLng(30.1575, 71.5249); // Multan
+
+  /// Points allowed before a rewarded ad is required. There's no upper
+  /// ceiling — each ad watch adds [_pointsPerAd] more, and the user can
+  /// keep watching ads to keep extending the boundary as much as they
+  /// want. Both numbers are plain constants — change them here to retune.
+  static const int _freePointsLimit = 4;
+  static const int _pointsPerAd = 4;
 
   GoogleMapController? _mapController;
 
@@ -43,6 +53,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   bool _resolvingStartLocation = true;
 
   final SavedPlotsRepository _savedPlotsRepository = SavedPlotsRepository();
+  final PointsBudgetRepository _pointsBudgetRepository = PointsBudgetRepository();
 
   MapType _mapType = MapType.hybrid;
 
@@ -51,10 +62,63 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   /// false once we can confirm the user is somewhere else.
   bool _showLocalUnits = true;
 
+  final RewardedAdService _rewardedAdService = RewardedAdService();
+
+  /// How many rewarded ads the user has watched this session — each one
+  /// adds [_pointsPerAd] to the allowed point count. Session-only by
+  /// design (resets on app restart); persisting this is possible later
+  /// the same way saved plots are, if you want it to survive a restart.
+  int _adsWatchedThisSession = 0;
+
+  /// A point the user tapped that couldn't be placed yet because the
+  /// current limit was hit — placed automatically once they earn the
+  /// reward, so watching the ad doesn't lose their tap.
+  LatLng? _pendingPointAfterAd;
+
+  int get _pointsAllowed =>
+      _freePointsLimit + (_adsWatchedThisSession * _pointsPerAd);
+
+  /// Points "spent" toward the limit — increases when a point is placed,
+  /// but unlike _points.length, does NOT decrease when a point is
+  /// deleted via the pin's delete sheet. Without this, someone could
+  /// place a point, delete it, place another, delete it, forever,
+  /// without ever needing to watch an ad. Undo/redo are the exception:
+  /// they mirror the exact last action, so they do adjust this count —
+  /// only the explicit "delete this point" action doesn't.
+  int _pointsUsed = 0;
+
   @override
   void initState() {
     super.initState();
     _resolveStartLocation();
+    _restorePointsBudget();
+    AppUpdateService.checkAndForceUpdateIfNeeded();
+  }
+
+  /// Restores how many points have been spent and how many ads have been
+  /// watched — but deliberately leaves the map empty. Only the budget
+  /// carries across a restart, not the unsaved drawing itself.
+  Future<void> _restorePointsBudget() async {
+    final budget = await _pointsBudgetRepository.load();
+    if (!mounted) return;
+    if (budget.pointsUsed == 0 && budget.adsWatched == 0) return;
+    setState(() {
+      _pointsUsed = budget.pointsUsed;
+      _adsWatchedThisSession = budget.adsWatched;
+    });
+  }
+
+  void _persistPointsBudget() {
+    _pointsBudgetRepository.save(
+      pointsUsed: _pointsUsed,
+      adsWatched: _adsWatchedThisSession,
+    );
+  }
+
+  @override
+  void dispose() {
+    _rewardedAdService.dispose();
+    super.dispose();
   }
 
   // ---------------------------------------------------------------------
@@ -133,11 +197,77 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   // ---------------------------------------------------------------------
 
   void _addPoint(LatLng point) {
+    if (_pointsUsed >= _pointsAllowed) {
+      _showPointLimitReached(point);
+      return;
+    }
     setState(() {
       _points.add(point);
+      _pointsUsed++;
       _redoStack.clear(); // a fresh action invalidates any pending redo
     });
     _refreshLengthLabels();
+  }
+
+  void _showPointLimitReached(LatLng tappedPoint) {
+    _pendingPointAfterAd = tappedPoint;
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Unlock more points'),
+        content: Text(
+          "You've used all $_pointsAllowed available points. Watch a "
+          'short video to unlock $_pointsPerAd more for this plot.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              _pendingPointAfterAd = null;
+              Navigator.pop(context);
+            },
+            child: const Text('Not now'),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              Navigator.pop(context);
+              _watchAdForMorePoints();
+            },
+            icon: const Icon(Icons.play_circle_outline),
+            label: const Text('Watch ad'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _watchAdForMorePoints() async {
+    if (!_rewardedAdService.isReady) {
+      _showSnack('Ad not ready yet — try again in a moment.');
+      _pendingPointAfterAd = null;
+      return;
+    }
+
+    final bool shown = await _rewardedAdService.show(
+      onUserEarnedReward: () {
+        if (!mounted) return;
+        setState(() {
+          _adsWatchedThisSession++;
+          if (_pendingPointAfterAd != null) {
+            _points.add(_pendingPointAfterAd!);
+            _pointsUsed++;
+            _redoStack.clear();
+            _pendingPointAfterAd = null;
+          }
+        });
+        _refreshLengthLabels();
+        _showSnack('Unlocked $_pointsPerAd more points — $_pointsAllowed total now.');
+      },
+    );
+
+    if (!shown) {
+      _showSnack('Ad not ready yet — try again in a moment.');
+      _pendingPointAfterAd = null;
+    }
   }
 
   void _movePoint(int index, LatLng newPosition) {
@@ -147,13 +277,19 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
 
   void _undoLastPoint() {
     if (_points.isEmpty) return;
-    setState(() => _redoStack.add(_points.removeLast()));
+    setState(() {
+      _redoStack.add(_points.removeLast());
+      _pointsUsed--;
+    });
     _refreshLengthLabels();
   }
 
   void _redoLastPoint() {
     if (_redoStack.isEmpty) return;
-    setState(() => _points.add(_redoStack.removeLast()));
+    setState(() {
+      _points.add(_redoStack.removeLast());
+      _pointsUsed++;
+    });
     _refreshLengthLabels();
   }
 
@@ -162,6 +298,11 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
     setState(() {
       _points.clear();
       _redoStack.clear();
+      // Deliberately NOT resetting _pointsUsed here. It must only ever
+      // decrease via Undo (which reverses your exact last action) — not
+      // via clearing the map, and not via deleting an individual point.
+      // Otherwise "clear + redraw" becomes a free way to dodge the ad
+      // wall, exactly the loophole this counter exists to prevent.
     });
     _refreshLengthLabels();
   }
@@ -270,6 +411,14 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
         ..addAll(selected.points);
       _redoStack.clear();
       _showLocalUnits = selected.showLocalUnits;
+      final int extraNeeded = selected.points.length - _freePointsLimit;
+      if (extraNeeded > 0) {
+        final int adsNeeded = (extraNeeded / _pointsPerAd).ceil();
+        if (adsNeeded > _adsWatchedThisSession) {
+          _adsWatchedThisSession = adsNeeded;
+        }
+      }
+      _pointsUsed = selected.points.length;
     });
     await _refreshLengthLabels();
     _fitCameraToCurrentPoints();
@@ -376,6 +525,7 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
   /// label markers for them. Runs after any point add/move/remove — never
   /// continuously during a drag — so it stays cheap.
   Future<void> _refreshLengthLabels() async {
+    _persistPointsBudget();
     final List<_Edge> edges = _currentEdges();
     if (edges.isEmpty) {
       if (_lengthLabelMarkers.isNotEmpty && mounted) {
@@ -547,6 +697,8 @@ class _LandAreaCalculatorScreenState extends State<LandAreaCalculatorScreen> {
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
               child: AreaInfoPanel(
                 pointCount: _points.length,
+                pointsUsed: _pointsUsed,
+                pointsAllowed: _pointsAllowed,
                 areaInSquareMeters: areaSqMeters,
                 showLocalUnits: _showLocalUnits,
               ),

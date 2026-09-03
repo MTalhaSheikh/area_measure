@@ -8,11 +8,22 @@ class AreaInfoPanel extends StatelessWidget {
   const AreaInfoPanel({
     super.key,
     required this.pointCount,
+    required this.pointsUsed,
+    required this.pointsAllowed,
     required this.areaInSquareMeters,
     required this.showLocalUnits,
   });
 
   final int pointCount;
+
+  /// Points spent toward [pointsAllowed]. Shown in the chip instead of
+  /// [pointCount] because deleting a point no longer frees up its slot —
+  /// this can be higher than the live [pointCount] on the map.
+  final int pointsUsed;
+
+  /// The current cap on points (free limit, or the higher limit unlocked
+  /// via a rewarded ad). Shown next to the count, e.g. "3/4 pts".
+  final int pointsAllowed;
   final double areaInSquareMeters;
 
   /// Whether to include marla/kanal alongside the universal units. False
@@ -51,7 +62,7 @@ class AreaInfoPanel extends StatelessWidget {
                 ),
                 const Spacer(),
                 Chip(
-                  label: Text('$pointCount pt${pointCount == 1 ? '' : 's'}'),
+                  label: Text('$pointsUsed/$pointsAllowed pts'),
                   visualDensity: VisualDensity.compact,
                   materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),

@@ -38,6 +38,8 @@ dependencies:
   geolocator: ^14.0.1
   shared_preferences: ^2.5.4
   geocoding: ^4.0.0
+  google_mobile_ads: ^7.0.0
+  in_app_update: ^4.2.5
 
 dev_dependencies:
   flutter_test:
